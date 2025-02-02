@@ -1,0 +1,126 @@
+#!/usr/bin/bash
+
+# set -x
+
+# APIキーを設定 (環境変数から取得することを推奨)
+API_KEY="${GEMINI_API_KEY}"
+if [ -z "$API_KEY" ]; then
+  echo "エラー: 環境変数 GEMINI_API_KEY が設定されていません。" >&2
+  exit 1
+fi
+
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed."
+    echo "Please install jq first:"
+    echo "  Ubuntu/Debian: sudo apt-get install jq"
+    echo "  MacOS: brew install jq"
+    exit 1
+fi
+
+# モデル名を設定 (環境変数から取得することも推奨)
+MODEL_NAME="${GEMINI_MODEL_NAME:-gemini-1.5-flash}"
+
+# Gemini APIのエンドポイント
+API_ENDPOINT="https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}"
+
+# セッション固有の履歴ファイルを設定
+# Get parent shell's PID (session identifier)
+PARENT_PID=$(ps -o ppid= $$)
+HISTORY_FILE="/tmp/gemini_history_${PARENT_PID}.json"
+
+# 終了時に履歴ファイルを削除
+# Initialize history file if it doesn't exist
+if [ ! -f "$HISTORY_FILE" ]; then
+    echo '[]' > "$HISTORY_FILE"
+    # Set up cleanup on terminal exit
+    # Store cleanup command in a session-specific file
+    CLEANUP_FILE="/tmp/gemini_cleanup_${PARENT_PID}"
+    echo "rm -f $HISTORY_FILE" > "$CLEANUP_FILE"
+    chmod +x "$CLEANUP_FILE"
+
+    # Add cleanup to .bash_logout or equivalent if it exists
+    if [ -f "$HOME/.bash_logout" ]; then
+        echo "$CLEANUP_FILE" >> "$HOME/.bash_logout"
+    fi
+
+    # Also set trap for common exit signals
+    trap "rm -f $CLEANUP_FILE" EXIT HUP TERM
+fi
+
+# コマンドライン引数の処理
+case "$1" in
+    --show)
+        echo "=== 会話履歴 ==="
+        jq -r '.[] | "Q: \(.question)\nA: \(.answer)\n"' "$HISTORY_FILE" || {
+            echo "エラー: 履歴の読み込みに失敗しました。" >&2
+            exit 1
+        }
+        echo "=============="
+        exit 0
+        ;;
+    --clear)
+        if rm -f "$HISTORY_FILE"; then
+            echo "履歴をクリアしました。"
+        else
+            echo "エラー: 履歴のクリアに失敗しました。" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    "")
+        echo "使用方法: $(basename "$0") <質問文> または --show または --clear" >&2
+        exit 1
+        ;;
+esac
+
+# 全ての引数を結合して質問文を作成
+QUESTION="$*"
+
+# 履歴から過去の会話を取得してコンテキストを構築
+CONTEXT=$(jq -r '.[] | "Q: \(.question)\nA: \(.answer)\n"' "$HISTORY_FILE")
+
+# JSONリクエストを作成
+JSON_DATA=$(cat << EOF
+{
+    "contents": [{
+        "parts":[{"text": "以下は今までの会話履歴です：\n${CONTEXT}\n新しい質問：${QUESTION}\n端末で結果を表示します。簡潔な回答をしてください。"}]
+    }]
+}
+EOF
+)
+
+# curlでリクエストを送信し、レスポンスを処理
+RESPONSE=$(curl -s -w "%{http_code}" -H "Content-Type: application/json" -X POST -d "$JSON_DATA" "$API_ENDPOINT")
+
+# HTTPステータスコードを取得
+HTTP_STATUS_CODE=$(echo "$RESPONSE" | tail -n 1)
+
+# JSON部分を取得
+RESPONSE=$(echo "$RESPONSE" | head -n -1)
+
+if [ "$HTTP_STATUS_CODE" -ne 200 ]; then
+  echo "エラー: APIリクエストに失敗しました。HTTPステータスコード: $HTTP_STATUS_CODE" >&2
+  echo "レスポンス:\n$RESPONSE" >&2
+  exit 1
+fi
+
+# レスポンスからtextキーの値を取得
+TEXT_RESPONSE=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text')
+
+# エラー処理
+if [ -z "$TEXT_RESPONSE" ]; then
+  echo "エラー: レスポンスからテキストを取得できませんでした。" >&2
+  echo "レスポンス:\n$RESPONSE" >&2
+  exit 1
+fi
+
+# 回答を表示
+echo "$TEXT_RESPONSE"
+
+# 履歴に追加
+temp_file=$(mktemp)
+jq --arg question "$QUESTION" --arg answer "$TEXT_RESPONSE" \
+  '. + [{"question": $question, "answer": $answer}]' "$HISTORY_FILE" > "$temp_file"
+mv "$temp_file" "$HISTORY_FILE"
+chmod 600 "$HISTORY_FILE"  # Make the file readable only by the owner

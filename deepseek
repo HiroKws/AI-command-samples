@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# DeepSeek APIコマンドラインインターフェース
+# 使用方法: deepseek "質問文" または --clear/--show
+
+# APIキーチェック
+if [ -z "$DEEPSEEK_API_KEY" ]; then
+    echo "エラー: DEEPSEEK_API_KEY環境変数が設定されていません"
+    echo "設定方法: export DEEPSEEK_API_KEY='your-api-key'"
+    exit 1
+fi
+
+# jqインストールチェック
+if ! command -v jq &> /dev/null; then
+    echo "エラー: jqが必要ですがインストールされていません"
+    echo "インストール方法:"
+    echo "  Ubuntu/Debian: sudo apt-get install jq"
+    echo "  MacOS: brew install jq"
+    exit 1
+fi
+
+# セッション管理の設定
+PARENT_PID=$(ps -o ppid= $$)
+SESSION_FILE="/tmp/deepseek_session_${PARENT_PID}.json"
+API_ENDPOINT="https://api.deepseek.com/v1/chat/completions"
+
+# セッションファイル初期化
+if [ ! -f "$SESSION_FILE" ]; then
+    echo '[]' > "$SESSION_FILE"
+    # 終了時クリーンアップ設定
+    CLEANUP_FILE="/tmp/deepseek_cleanup_${PARENT_PID}"
+    echo "rm -f $SESSION_FILE" > "$CLEANUP_FILE"
+    chmod +x "$CLEANUP_FILE"
+
+    # bashログアウト時にクリーンアップ
+    if [ -f "$HOME/.bash_logout" ]; then
+        echo "$CLEANUP_FILE" >> "$HOME/.bash_logout"
+    fi
+
+    # シグナルトラップ設定
+    trap "rm -f $SESSION_FILE $CLEANUP_FILE" EXIT HUP TERM
+fi
+
+# ヘルプ表示
+if [ $# -eq 0 ]; then
+    echo "使用方法: deepseek \"質問文\""
+    echo "例: deepseek \"フランスの首都は？\""
+    echo "特殊コマンド:"
+    echo "  deepseek --clear 会話履歴を削除"
+    echo "  deepseek --show  会話履歴を表示"
+    exit 0
+fi
+
+# 特殊コマンド処理
+case "$1" in
+    --clear)
+        echo '[]' > "$SESSION_FILE"
+        echo "会話履歴をクリアしました"
+        exit 0
+        ;;
+    --show)
+        echo "=== 会話履歴 ==="
+        jq -r '.[] | "\(.role | sub("user"; "質問")): \(.content)"' "$SESSION_FILE"
+        echo "================"
+        exit 0
+        ;;
+esac
+
+# 質問文を結合
+QUESTION="$*"
+
+# システムプロンプト（簡潔な日本語回答を指示）
+SYSTEM_INSTRUCTION="端末表示用に簡潔で明確な日本語で回答してください。余分な書式や説明は省き、要点のみを答えてください。質問："
+
+# メッセージ構築
+current_history=$(cat "$SESSION_FILE")
+messages_json=$(echo "$current_history" | jq --arg q "${SYSTEM_INSTRUCTION}${QUESTION}" '. + [{"role": "user", "content": $q}]')
+
+# APIリクエスト実行
+response=$(curl -s $API_ENDPOINT \
+    -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+    -H "Content-Type: application/json" \
+    --data @- <<EOF
+{
+    "model": "deepseek-chat",
+    "messages": $messages_json,
+    "max_tokens": 1024,
+    "temperature": 0.3
+}
+EOF
+)
+
+# エラーハンドリング
+if ! response_text=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null); then
+    echo "エラー: APIレスポンスの解析に失敗しました"
+    echo "$response" | jq -r '.error.message // "不明なエラー"'
+    exit 1
+fi
+
+if [ -z "$response_text" ]; then
+    echo "エラー: 空のレスポンスが返されました"
+    exit 1
+fi
+
+# 履歴更新
+echo "$messages_json" | jq --arg resp "$response_text" '. + [{"role": "assistant", "content": $resp}]' > "$SESSION_FILE"
+
+# レスポンス表示
+echo "$response_text"

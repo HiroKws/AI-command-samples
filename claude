@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# Check if ANTHROPIC_API_KEY is set
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "Error: ANTHROPIC_API_KEY environment variable is not set"
+    echo "Please set it with: export ANTHROPIC_API_KEY='your-api-key'"
+    exit 1
+fi
+
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed."
+    echo "Please install jq first:"
+    echo "  Ubuntu/Debian: sudo apt-get install jq"
+    echo "  MacOS: brew install jq"
+    exit 1
+fi
+
+# Get parent shell's PID (session identifier)
+PARENT_PID=$(ps -o ppid= $$)
+SESSION_FILE="/tmp/claude_session_${PARENT_PID}.json"
+
+# Initialize session file if it doesn't exist
+if [ ! -f "$SESSION_FILE" ]; then
+    echo '[]' > "$SESSION_FILE"
+    # Set up cleanup on terminal exit
+    # Store cleanup command in a session-specific file
+    CLEANUP_FILE="/tmp/claude_cleanup_${PARENT_PID}"
+    echo "rm -f $SESSION_FILE" > "$CLEANUP_FILE"
+    chmod +x "$CLEANUP_FILE"
+
+    # Add cleanup to .bash_logout or equivalent if it exists
+    if [ -f "$HOME/.bash_logout" ]; then
+        echo "$CLEANUP_FILE" >> "$HOME/.bash_logout"
+    fi
+
+    # Also set trap for common exit signals
+    trap "rm -f $SESSION_FILE $CLEANUP_FILE" EXIT HUP TERM
+fi
+
+# Show help if no arguments provided
+if [ $# -eq 0 ]; then
+    echo "Usage: claude \"your question here\""
+    echo "Example: claude \"フランスの首都は？\""
+    echo "Special commands:"
+    echo "  claude --clear   Clear conversation history"
+    echo "  claude --show    Show conversation history"
+    exit 1
+fi
+
+# Handle special commands
+case "$1" in
+    --clear)
+        echo '[]' > "$SESSION_FILE"
+        echo "会話履歴をクリアしました"
+        exit 0
+        ;;
+    --show)
+        echo "会話履歴:"
+        if [ -s "$SESSION_FILE" ]; then
+            cat "$SESSION_FILE" | jq -r '.[] | "[\(.role)] \(.content)"' 2>/dev/null || echo "履歴の読み込みに失敗しました"
+        else
+            echo "履歴はありません"
+        fi
+        exit 0
+        ;;
+esac
+
+# Read current history
+current_history=$(cat "$SESSION_FILE")
+
+# Combine all arguments into a single question
+question="$*"
+
+# Add instruction for simple response in Japanese
+system_instruction="端末出力用に明確で簡潔な回答を日本語で提供してください。説明や余分な書式を省いて、要点のみを簡潔に答えてください。質問: "
+full_prompt="${system_instruction}${question}"
+
+# Create messages array for the API call
+messages_json=$(echo "$current_history" | jq --arg q "$full_prompt" '. + [{"role": "user", "content": $q}]')
+
+# Make the API call
+response=$(curl -s https://api.anthropic.com/v1/messages \
+    --header "x-api-key: $ANTHROPIC_API_KEY" \
+    --header "anthropic-version: 2023-06-01" \
+    --header "content-type: application/json" \
+    --data @- <<EOF
+{
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "messages": $messages_json
+}
+EOF
+)
+
+# Extract response text
+response_text=$(echo "$response" | jq -r '.content[0].text // empty')
+if [ -z "$response_text" ]; then
+    echo "Error: Failed to get response from Claude"
+    echo "$response" | jq -r '.error.message // "Unknown error"'
+    exit 1
+fi
+
+# Update history file with both question and response
+echo "$messages_json" | jq --arg resp "$response_text" '. + [{"role": "assistant", "content": $resp}]' > "$SESSION_FILE"
+
+# Print response
+echo "$response_text"
